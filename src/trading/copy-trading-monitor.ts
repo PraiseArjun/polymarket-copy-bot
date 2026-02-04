@@ -1,7 +1,13 @@
 import { AccountMonitor } from '../monitor/account-monitor';
 import { PolymarketClient } from '../api/polymarket-client';
 import { TradeExecutor } from './trade-executor';
-import { Position, TradingStatus, MonitorOptions, CopyTradingConfig, CopyTradingStatus } from '../types';
+import {
+  Position,
+  TradingStatus,
+  MonitorOptions,
+  CopyTradingConfig,
+  CopyTradingStatus
+} from '../types';
 
 /**
  * Copy Trading Monitor
@@ -12,9 +18,12 @@ export class CopyTradingMonitor {
   private tradeExecutor: TradeExecutor;
   private config: CopyTradingConfig;
   private stats: CopyTradingStatus;
-  private executedPositions: Set<string> = new Set(); // Track positions we've already executed
-  private targetPositions: Map<string, Position> = new Map(); // Track target's current positions
+  private executedPositions: Set<string> = new Set();
+  private targetPositions: Map<string, Position> = new Map();
   private targetAddress: string;
+
+  // 🔒 Prevent overlapping status updates
+  private isProcessingUpdate = false;
 
   constructor(
     client: PolymarketClient,
@@ -23,11 +32,9 @@ export class CopyTradingMonitor {
   ) {
     this.config = copyTradingConfig;
     this.targetAddress = monitorOptions.targetAddress;
-    
-    // Initialize trade executor
+
     this.tradeExecutor = new TradeExecutor(copyTradingConfig);
-    
-    // Initialize statistics
+
     this.stats = {
       enabled: copyTradingConfig.enabled,
       dryRun: copyTradingConfig.dryRun ?? false,
@@ -36,34 +43,22 @@ export class CopyTradingMonitor {
       totalVolume: '0',
     };
 
-    // Create account monitor with custom update handler
     this.accountMonitor = new AccountMonitor(client, {
       ...monitorOptions,
       onUpdate: (status: TradingStatus) => {
-        // Call original callback if provided
-        if (monitorOptions.onUpdate) {
-          monitorOptions.onUpdate(status);
-        }
-        
-        // Execute copy trading logic
+        monitorOptions.onUpdate?.(status);
+
         if (this.config.enabled) {
           this.handleStatusUpdate(status);
         }
       },
       onError: (error: Error) => {
-        // Call original error handler if provided
-        if (monitorOptions.onError) {
-          monitorOptions.onError(error);
-        }
-        
+        monitorOptions.onError?.(error);
         console.error('Copy trading monitor error:', error);
       },
     });
   }
 
-  /**
-   * Start monitoring and copy trading
-   */
   async start(): Promise<void> {
     if (!this.config.enabled) {
       console.log('⚠️  Copy trading is disabled. Starting monitor only...');
@@ -74,150 +69,121 @@ export class CopyTradingMonitor {
     console.log('🚀 Starting copy trading monitor...');
     console.log(`📊 Target address: ${this.targetAddress}`);
     console.log(`👛 Trading wallet: ${this.tradeExecutor.getWalletAddress()}`);
-    
-    if (this.config.dryRun) {
-      console.log('🔍 DRY RUN MODE: No actual trades will be executed');
-    } else {
-      console.log('✅ LIVE MODE: Trades will be executed');
-    }
+    console.log(this.config.dryRun ? '🔍 DRY RUN MODE' : '✅ LIVE MODE');
 
-    // Initialize trade executor
     try {
       await this.tradeExecutor.initialize();
     } catch (error: any) {
       console.error('Failed to initialize trade executor:', error.message);
-      if (!this.config.dryRun) {
-        throw error;
-      }
+      if (!this.config.dryRun) throw error;
     }
 
-    // Start monitoring
     await this.accountMonitor.start();
     console.log('✅ Copy trading monitor started');
   }
 
-  /**
-   * Stop monitoring and copy trading
-   */
   stop(): void {
     this.accountMonitor.stop();
     console.log('🛑 Copy trading monitor stopped');
   }
 
-  /**
-   * Handle status updates and execute copy trades
-   */
   private async handleStatusUpdate(status: TradingStatus): Promise<void> {
-    const currentPositions = new Map<string, Position>();
-    status.openPositions.forEach(pos => {
-      currentPositions.set(pos.id, pos);
-    });
+    if (this.isProcessingUpdate) return;
+    this.isProcessingUpdate = true;
 
-    // Detect new positions (positions in current but not in target)
-    const newPositions: Position[] = [];
-    for (const [id, position] of currentPositions) {
-      if (!this.targetPositions.has(id)) {
-        newPositions.push(position);
-      }
-    }
+    try {
+      const currentPositions = new Map<string, Position>();
+      status.openPositions.forEach(pos => currentPositions.set(pos.id, pos));
 
-    // Detect closed positions (positions in target but not in current)
-    const closedPositions: Position[] = [];
-    for (const [id, position] of this.targetPositions) {
-      if (!currentPositions.has(id)) {
-        closedPositions.push(position);
-      }
-    }
+      const newPositions: Position[] = [];
+      const closedPositions: Position[] = [];
 
-    // Execute buy orders for new positions
-    for (const position of newPositions) {
-      // Skip if we already executed this position
-      if (this.executedPositions.has(position.id)) {
-        continue;
+      for (const [id, pos] of currentPositions) {
+        if (!this.targetPositions.has(id)) newPositions.push(pos);
       }
 
-      try {
-        console.log(`\n🆕 New position detected: ${position.market.question}`);
-        console.log(`   Outcome: ${position.outcome}`);
-        console.log(`   Quantity: ${position.quantity} shares @ $${position.price}`);
-        
-        const result = await this.tradeExecutor.executeBuy(position);
-        
-        if (result.success) {
-          this.executedPositions.add(position.id);
-          this.stats.totalTradesExecuted++;
-          const tradeValue = parseFloat(result.executedQuantity || '0') * parseFloat(result.executedPrice || '0');
-          this.stats.totalVolume = (parseFloat(this.stats.totalVolume) + tradeValue).toFixed(2);
-          this.stats.lastTradeTime = new Date().toISOString();
-        } else {
+      for (const [id, pos] of this.targetPositions) {
+        if (!currentPositions.has(id)) closedPositions.push(pos);
+      }
+
+      for (const position of newPositions) {
+        if (this.executedPositions.has(position.id)) continue;
+
+        try {
+          console.log(`\n🆕 New position: ${position.market.question}`);
+          const result = await this.tradeExecutor.executeBuy(position);
+
+          if (result.success) {
+            this.executedPositions.add(position.id);
+            this.stats.totalTradesExecuted++;
+
+            const qty = Number(result.executedQuantity) || 0;
+            const price = Number(result.executedPrice) || 0;
+            const tradeValue = qty * price;
+
+            this.stats.totalVolume = (
+              Number(this.stats.totalVolume) + tradeValue
+            ).toFixed(2);
+
+            this.stats.lastTradeTime = new Date().toISOString();
+          } else {
+            this.stats.totalTradesFailed++;
+            console.error('Buy failed:', result.error);
+          }
+        } catch (error: any) {
           this.stats.totalTradesFailed++;
-          console.error(`Failed to execute buy order: ${result.error}`);
+          console.error('Buy error:', error.message);
         }
-      } catch (error: any) {
-        this.stats.totalTradesFailed++;
-        console.error(`Error executing buy order:`, error.message);
-      }
-    }
-
-    // Execute sell orders for closed positions
-    for (const position of closedPositions) {
-      // Only sell if we previously bought this position
-      if (!this.executedPositions.has(position.id)) {
-        continue;
       }
 
-      try {
-        console.log(`\n❌ Position closed: ${position.market.question}`);
-        console.log(`   Outcome: ${position.outcome}`);
-        console.log(`   Quantity: ${position.quantity} shares @ $${position.price}`);
-        
-        const result = await this.tradeExecutor.executeSell(position);
-        
-        if (result.success) {
-          // Remove from executed positions (position is closed)
-          this.executedPositions.delete(position.id);
-          this.stats.totalTradesExecuted++;
-          const tradeValue = parseFloat(result.executedQuantity || '0') * parseFloat(result.executedPrice || '0');
-          this.stats.totalVolume = (parseFloat(this.stats.totalVolume) + tradeValue).toFixed(2);
-          this.stats.lastTradeTime = new Date().toISOString();
-        } else {
+      for (const position of closedPositions) {
+        if (!this.executedPositions.has(position.id)) continue;
+
+        try {
+          console.log(`\n❌ Position closed: ${position.market.question}`);
+          const result = await this.tradeExecutor.executeSell(position);
+
+          if (result.success) {
+            this.executedPositions.delete(position.id);
+            this.stats.totalTradesExecuted++;
+
+            const qty = Number(result.executedQuantity) || 0;
+            const price = Number(result.executedPrice) || 0;
+            const tradeValue = qty * price;
+
+            this.stats.totalVolume = (
+              Number(this.stats.totalVolume) + tradeValue
+            ).toFixed(2);
+
+            this.stats.lastTradeTime = new Date().toISOString();
+          } else {
+            this.stats.totalTradesFailed++;
+            console.error('Sell failed:', result.error);
+          }
+        } catch (error: any) {
           this.stats.totalTradesFailed++;
-          console.error(`Failed to execute sell order: ${result.error}`);
+          console.error('Sell error:', error.message);
         }
-      } catch (error: any) {
-        this.stats.totalTradesFailed++;
-        console.error(`Error executing sell order:`, error.message);
       }
-    }
 
-    // Update target positions map
-    this.targetPositions = currentPositions;
+      this.targetPositions = currentPositions;
+    } finally {
+      this.isProcessingUpdate = false;
+    }
   }
 
-  /**
-   * Get copy trading statistics
-   */
   getStats(): CopyTradingStatus {
     return { ...this.stats };
   }
 
-  /**
-   * Check if monitor is running
-   */
   isRunning(): boolean {
     return this.accountMonitor.isRunning();
   }
 
-  /**
-   * Get account monitor instance
-   */
   getAccountMonitor(): AccountMonitor {
     return this.accountMonitor;
   }
 
-  /**
-   * Get trade executor instance
-   */
   getTradeExecutor(): TradeExecutor {
     return this.tradeExecutor;
   }
